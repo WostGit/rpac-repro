@@ -1,0 +1,52 @@
+name: Reproducible PAC Privacy Experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: "Experiment script to run (Iris_s.py or MNIST_s.py)"
+        required: false
+        default: "Iris_s.py"
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  pac-privacy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHON_VERSION: "3.10"
+      VENV_DIR: ".venv"
+      UPSTREAM_REPO: "https://github.com/ztao10086/Residual-PAC-Privacy.git"
+      RESULTS_DIR: "artifacts"
+      MAX_INSTALL_RETRIES: "10"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_DEFAULT_TIMEOUT: "120"
+      PYTHONHASHSEED: "0"
+      CUBLAS_WORKSPACE_CONFIG: ":16:8"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run minimal PAC-style privacy experiment (self-repairing)
+        run: bash scripts/run_pac_privacy_ci.sh "${{ github.event.inputs.experiment || 'Iris_s.py' }}"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pac-privacy-artifacts
+          path: |
+            artifacts/run.log
+            artifacts/time.txt
+            artifacts/metrics.json
+            artifacts/diagnostics.txt
+          if-no-files-found: warn
