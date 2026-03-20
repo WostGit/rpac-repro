@@ -1,0 +1,311 @@
+name: Reproducible PAC Privacy Experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: "Experiment script to run"
+        required: true
+        default: "Iris_s.py"
+        type: choice
+        options:
+          - Iris_s.py
+          - MNIST_s.py
+  schedule:
+    - cron: '17 4 * * 1'
+
+jobs:
+  run-pac-experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHON_VERSION: "3.10"
+      REPO_URL: "https://github.com/ztao10086/Residual-PAC-Privacy.git"
+      TARGET_SCRIPT: "${{ inputs.experiment || 'Iris_s.py' }}"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+      PYTHONHASHSEED: "0"
+      CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      TORCH_NUM_THREADS: "1"
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Clone upstream experiment repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "$REPO_URL" upstream
+          test -f upstream/README.md
+          test -f "upstream/$TARGET_SCRIPT"
+
+      - name: Build resilient reproducible environment and run experiment
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORKDIR="$PWD/upstream"
+          VENV_DIR="$WORKDIR/.venv"
+          LOG_DIR="$PWD/artifacts"
+          LOG_FILE="$LOG_DIR/experiment.log"
+          METRICS_JSON="$LOG_DIR/metrics.json"
+          DIAG_FILE="$LOG_DIR/diagnostics.txt"
+          PIP_FREEZE_FILE="$LOG_DIR/pip-freeze.txt"
+
+          mkdir -p "$LOG_DIR"
+          : > "$LOG_FILE"
+
+          trap 'rc=$?; {
+            echo "===== FAILURE DIAGNOSTICS =====";
+            echo "Exit code: $rc";
+            echo "Date (UTC): $(date -u +"%Y-%m-%dT%H:%M:%SZ")";
+            echo "Python version:";
+            python --version 2>&1 || true;
+            if [ -f "$VENV_DIR/bin/activate" ]; then
+              # shellcheck disable=SC1091
+              source "$VENV_DIR/bin/activate" || true;
+              echo "pip version:";
+              pip --version 2>&1 || true;
+              echo "pip freeze:";
+              pip freeze 2>&1 || true;
+            fi;
+            echo "Last 200 lines of experiment log:";
+            tail -n 200 "$LOG_FILE" 2>/dev/null || true;
+          } | tee "$DIAG_FILE"; exit $rc' ERR
+
+          cd "$WORKDIR"
+
+          build_fresh_venv() {
+            rm -rf "$VENV_DIR"
+            python -m venv "$VENV_DIR"
+            # shellcheck disable=SC1091
+            source "$VENV_DIR/bin/activate"
+            python -m pip install --upgrade pip setuptools wheel
+          }
+
+          validate_env_health() {
+            # shellcheck disable=SC1091
+            source "$VENV_DIR/bin/activate"
+            python - <<'PY'
+import importlib
+mods = [
+    "numpy",
+    "torch",
+    "torchvision",
+    "nflows",
+    "sklearn",
+]
+missing = []
+for m in mods:
+    try:
+        importlib.import_module(m)
+    except Exception as e:
+        missing.append(f"{m}: {e}")
+if missing:
+    raise SystemExit("Module validation failed:\n" + "\n".join(missing))
+print("Module validation passed")
+PY
+          }
+
+          install_with_retries() {
+            # README specifies standard env with numpy, torch/torchvision, nflows, scikit-learn.
+            # Keep deterministic dependency resolution by pinning top-levels.
+            # shellcheck disable=SC1091
+            source "$VENV_DIR/bin/activate"
+            local attempt=1
+            local max_attempts=10
+            local sleep_s=2
+            while [ "$attempt" -le "$max_attempts" ]; do
+              echo "Dependency install attempt $attempt/$max_attempts" | tee -a "$LOG_FILE"
+              if pip install --no-input --retries 0 \
+                "numpy==1.26.4" \
+                "torch==2.5.1" \
+                "torchvision==0.20.1" \
+                "nflows==0.14" \
+                "scikit-learn==1.5.2"; then
+                if validate_env_health; then
+                  pip freeze | sort > "$PIP_FREEZE_FILE"
+                  return 0
+                fi
+              fi
+
+              echo "Install/validation failed on attempt $attempt" | tee -a "$LOG_FILE"
+              rm -rf "$VENV_DIR"
+              build_fresh_venv
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                echo "Sleeping ${sleep_s}s before retry" | tee -a "$LOG_FILE"
+                sleep "$sleep_s"
+                sleep_s=$(( sleep_s * 2 ))
+              fi
+              attempt=$(( attempt + 1 ))
+            done
+
+            echo "Failed to install dependencies after $max_attempts attempts" | tee -a "$LOG_FILE"
+            return 42
+          }
+
+          # Detect/repair corrupted or partially cached venv.
+          if [ -d "$VENV_DIR" ]; then
+            if [ ! -x "$VENV_DIR/bin/python" ] || [ ! -f "$VENV_DIR/pyvenv.cfg" ]; then
+              echo "Detected corrupted virtualenv, rebuilding" | tee -a "$LOG_FILE"
+              rm -rf "$VENV_DIR"
+            fi
+          fi
+
+          if [ ! -d "$VENV_DIR" ]; then
+            build_fresh_venv
+          else
+            # shellcheck disable=SC1091
+            source "$VENV_DIR/bin/activate"
+          fi
+
+          install_with_retries
+
+          # Minimal-resource execution profile.
+          export CUDA_VISIBLE_DEVICES=""
+          export MPLBACKEND="Agg"
+
+          python - <<'PY' > "$LOG_DIR/run_experiment.py"
+import json
+import math
+import os
+import re
+import resource
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+script = os.environ.get("TARGET_SCRIPT", "Iris_s.py")
+log_file = Path(os.environ.get("LOG_FILE", "experiment.log"))
+metrics_file = Path(os.environ.get("METRICS_JSON", "metrics.json"))
+
+cmd = [sys.executable, script]
+# Try common minimal-resource flags if script supports argparse.
+help_text = ""
+try:
+    h = subprocess.run([sys.executable, script, "--help"], capture_output=True, text=True, timeout=20)
+    help_text = (h.stdout or "") + "\n" + (h.stderr or "")
+except Exception:
+    pass
+
+def maybe_add(flag, value=None):
+    global cmd
+    if flag in help_text:
+        cmd += [flag] if value is None else [flag, str(value)]
+
+for flg, val in [
+    ("--batch-size", 1),
+    ("--batch_size", 1),
+    ("--subset", 16),
+    ("--subset-size", 16),
+    ("--num-samples", 16),
+    ("--num_samples", 16),
+    ("--repeats", 1),
+    ("--trials", 1),
+    ("--runs", 1),
+    ("--epochs", 1),
+]:
+    maybe_add(flg, val)
+
+start = time.time()
+peak_kb_before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+proc = subprocess.run(
+    cmd,
+    capture_output=True,
+    text=True,
+    timeout=1200,
+)
+end = time.time()
+peak_kb_after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+peak_kb = max(peak_kb_before, peak_kb_after)
+
+combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+log_file.write_text(combined, encoding="utf-8", errors="replace")
+
+if proc.returncode != 0:
+    print(f"Experiment crashed with code {proc.returncode}", file=sys.stderr)
+    sys.exit(20)
+
+lower = combined.lower()
+if re.search(r"(^|[^a-z])(nan|inf)([^a-z]|$)", lower):
+    print("Detected NaN/inf in output", file=sys.stderr)
+    sys.exit(21)
+
+# Capture a PAC/privacy bound from output with tolerant matching.
+pat = re.compile(
+    r"(?i)(?:pac|privacy|residual\s*pac|sr-pac)[^\n:=]{0,60}(?:bound|epsilon|eps)?[^\n:=]{0,20}[:=]\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+)
+vals = []
+for m in pat.finditer(combined):
+    try:
+        v = float(m.group(1))
+        if math.isfinite(v):
+            vals.append(v)
+    except Exception:
+        pass
+
+if not vals:
+    # Fallback: find finite floats on lines containing bound/privacy/pac.
+    for line in combined.splitlines():
+      l = line.lower()
+      if any(k in l for k in ["bound", "privacy", "pac", "epsilon", "eps"]):
+        for n in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", line):
+          try:
+            v = float(n)
+            if math.isfinite(v):
+              vals.append(v)
+          except Exception:
+            pass
+
+if not vals:
+    print("Could not compute a valid PAC-style privacy bound", file=sys.stderr)
+    sys.exit(22)
+
+bound = vals[-1]
+if not math.isfinite(bound):
+    print("Invalid non-finite PAC-style privacy bound", file=sys.stderr)
+    sys.exit(23)
+
+metrics = {
+    "script": script,
+    "command": cmd,
+    "pac_style_privacy_bound": bound,
+    "runtime_seconds": round(end - start, 6),
+    "peak_memory_kb": int(peak_kb),
+    "return_code": proc.returncode,
+}
+metrics_file.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(json.dumps(metrics, sort_keys=True))
+PY
+
+          # shellcheck disable=SC1091
+          source "$VENV_DIR/bin/activate"
+          export LOG_FILE METRICS_JSON
+          python "$LOG_DIR/run_experiment.py" | tee -a "$LOG_FILE"
+
+          # Final determinism metadata (inputs and versions).
+          {
+            echo "target_script=$TARGET_SCRIPT"
+            echo "python=$(python --version 2>&1)"
+            echo "pip=$(pip --version 2>&1)"
+            sha256sum "$TARGET_SCRIPT" README.md
+          } > "$LOG_DIR/reproducibility.txt"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pac-privacy-${{ env.TARGET_SCRIPT }}-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
