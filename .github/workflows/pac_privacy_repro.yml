@@ -1,0 +1,371 @@
+name: PAC Privacy Reproducible Experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "Experiment script to run"
+        required: true
+        default: "Iris_s.py"
+        type: choice
+        options:
+          - Iris_s.py
+          - MNIST_s.py
+      repo_ref:
+        description: "Upstream ref (branch/tag/commit)"
+        required: false
+        default: "main"
+  schedule:
+    - cron: "17 4 * * 1"
+
+jobs:
+  run-pac-experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONHASHSEED: "0"
+      CUBLAS_WORKSPACE_CONFIG: ":16:8"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+      TARGET_REPO: "https://github.com/ztao10086/Residual-PAC-Privacy.git"
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Clone upstream repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          git -c advice.detachedHead=false clone --depth 1 --branch "${{ github.event.inputs.repo_ref || 'main' }}" "$TARGET_REPO" work/upstream
+          pushd work/upstream >/dev/null
+          git rev-parse HEAD | tee ../upstream_commit.txt
+          popd >/dev/null
+
+      - name: Restore virtualenv cache
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: work/upstream/.venv
+          key: venv-${{ runner.os }}-py310-${{ hashFiles('work/upstream/README.md', '.github/workflows/pac_privacy_repro.yml') }}
+
+      - name: Build/repair environment, validate imports, and run experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd work/upstream
+          SCRIPT_NAME="${{ github.event.inputs.script || 'Iris_s.py' }}"
+          if [[ ! -f "$SCRIPT_NAME" ]]; then
+            echo "ERROR: script '$SCRIPT_NAME' not found" >&2
+            exit 10
+          fi
+
+          VENV_DIR=".venv"
+          LOG_DIR="../artifacts"
+          mkdir -p "$LOG_DIR"
+          RUN_LOG="$LOG_DIR/run.log"
+          DIAG_LOG="$LOG_DIR/diagnostics.log"
+          METRICS_JSON="$LOG_DIR/metrics.json"
+
+          python - <<'PY' > ../python_version.txt
+import platform, sys
+print(sys.version)
+print(platform.platform())
+PY
+
+          extract_install_cmds() {
+            local out_file="$1"
+            python - <<'PY' "$out_file"
+from pathlib import Path
+import re
+import sys
+
+out = Path(sys.argv[1])
+readme = Path("README.md")
+cmds = []
+if readme.exists():
+    text = readme.read_text(encoding="utf-8", errors="ignore")
+    blocks = re.findall(r"```(?:bash|sh|shell)?\\n(.*?)```", text, flags=re.S|re.I)
+    for block in blocks:
+        for line in block.splitlines():
+            s = line.strip()
+            if re.match(r"^(python\s+-m\s+)?pip3?\s+install\b", s):
+                cmds.append(s)
+# fallback: requirements files if README does not contain install commands
+if not cmds:
+    for name in ("requirements.txt", "requirement.txt", "requirements-dev.txt"):
+        if Path(name).exists():
+            cmds.append(f"python -m pip install -r {name}")
+            break
+out.write_text("\n".join(cmds) + ("\n" if cmds else ""), encoding="utf-8")
+PY
+          }
+
+          repair_venv() {
+            echo "[venv] rebuilding virtual environment"
+            rm -rf "$VENV_DIR"
+            python -m venv "$VENV_DIR"
+            source "$VENV_DIR/bin/activate"
+            python -m pip install --upgrade pip setuptools wheel
+          }
+
+          validate_core_venv() {
+            if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+              return 1
+            fi
+            source "$VENV_DIR/bin/activate"
+            python - <<'PY'
+import importlib
+for m in ("pip", "setuptools", "wheel"):
+    importlib.import_module(m)
+print("core-ok")
+PY
+          }
+
+          retry_install_cmd() {
+            local cmd="$1"
+            local max_attempts=10
+            local attempt=1
+            local delay=1
+            while (( attempt <= max_attempts )); do
+              echo "[pip] attempt ${attempt}/${max_attempts}: ${cmd}"
+              if bash -lc "$cmd"; then
+                return 0
+              fi
+              if (( attempt == max_attempts )); then
+                return 1
+              fi
+              echo "[pip] failed; sleeping ${delay}s before retry"
+              sleep "$delay"
+              delay=$(( delay * 2 ))
+              if (( delay > 300 )); then delay=300; fi
+              attempt=$(( attempt + 1 ))
+            done
+          }
+
+          validate_required_imports() {
+            source "$VENV_DIR/bin/activate"
+            python - <<'PY' "$SCRIPT_NAME"
+import ast
+import importlib
+import pathlib
+import re
+import sys
+
+script = pathlib.Path(sys.argv[1])
+mods = set()
+
+# Imports in selected script
+root = ast.parse(script.read_text(encoding="utf-8", errors="ignore"), filename=str(script))
+for node in ast.walk(root):
+    if isinstance(node, ast.Import):
+        for n in node.names:
+            mods.add(n.name.split(".")[0])
+    elif isinstance(node, ast.ImportFrom) and node.module:
+        mods.add(node.module.split(".")[0])
+
+# Parse README install commands for package names as additional required modules
+readme = pathlib.Path("README.md")
+if readme.exists():
+    txt = readme.read_text(encoding="utf-8", errors="ignore")
+    for match in re.findall(r"(?:python\s+-m\s+)?pip3?\s+install\s+([^\n`]+)", txt):
+        for tok in match.split():
+            if tok.startswith("-") or tok.startswith("http") or "/" in tok or tok.endswith(".txt"):
+                continue
+            pkg = re.split(r"[<>=\[]", tok)[0].strip().replace("-", "_")
+            if pkg:
+                mods.add(pkg)
+
+skip = {
+    "__future__", "os", "sys", "time", "json", "math", "random", "typing",
+    "collections", "itertools", "functools", "pathlib", "argparse", "subprocess",
+    "logging", "warnings", "copy", "dataclasses", "statistics", "pickle", "re"
+}
+mods = sorted(m for m in mods if m and m not in skip)
+failed = []
+for m in mods:
+    try:
+        importlib.import_module(m)
+    except Exception as e:
+        failed.append((m, str(e)))
+
+if failed:
+    print("import validation failed:")
+    for m, e in failed:
+        print(f" - {m}: {e}")
+    raise SystemExit(1)
+print("import validation passed for:", ", ".join(mods) if mods else "(no third-party modules detected)")
+PY
+          }
+
+          prepare_and_install() {
+            extract_install_cmds .install_cmds
+            if [[ ! -s .install_cmds ]]; then
+              echo "ERROR: no dependency install command found in README and no requirements file fallback." >&2
+              return 1
+            fi
+
+            if ! validate_core_venv; then
+              repair_venv
+            else
+              source "$VENV_DIR/bin/activate"
+            fi
+
+            while IFS= read -r cmd; do
+              [[ -z "$cmd" ]] && continue
+              cmd="${cmd/pip3/python -m pip}"
+              cmd="${cmd/pip /python -m pip }"
+              retry_install_cmd "$cmd"
+            done < .install_cmds
+
+            validate_required_imports
+          }
+
+          # self-healing install + validation
+          if ! prepare_and_install; then
+            echo "[repair] first installation/validation failed; wiping venv and retrying once"
+            repair_venv
+            if ! prepare_and_install; then
+              echo "ERROR: dependency installation/validation failed after repair" >&2
+              source "$VENV_DIR/bin/activate" || true
+              {
+                echo "==== Python Version ===="
+                python --version || true
+                echo "==== Pip Freeze ===="
+                python -m pip freeze || true
+              } | tee "$DIAG_LOG"
+              exit 20
+            fi
+          fi
+
+          source "$VENV_DIR/bin/activate"
+          python -m pip freeze | sort > "$LOG_DIR/pip_freeze.txt"
+
+          HELP_TEXT="$LOG_DIR/help.txt"
+          python "$SCRIPT_NAME" --help >"$HELP_TEXT" 2>&1 || true
+
+          EXTRA_ARGS=()
+          add_if_supported() {
+            local flag="$1"
+            local value="$2"
+            if grep -Eq -- "(^|[[:space:]])${flag}([=[:space:]]|,|$)" "$HELP_TEXT"; then
+              EXTRA_ARGS+=("$flag" "$value")
+            fi
+          }
+
+          add_if_supported "--batch_size" "1"
+          add_if_supported "--batch-size" "1"
+          add_if_supported "--epochs" "1"
+          add_if_supported "--epoch" "1"
+          add_if_supported "--n_runs" "1"
+          add_if_supported "--num_runs" "1"
+          add_if_supported "--repeat" "1"
+          add_if_supported "--repeats" "1"
+          add_if_supported "--trials" "1"
+          add_if_supported "--subset" "16"
+          add_if_supported "--dataset_shard" "16"
+          add_if_supported "--dataset-shard" "16"
+          add_if_supported "--sample_size" "16"
+          add_if_supported "--sample-size" "16"
+
+          echo "Running: python $SCRIPT_NAME ${EXTRA_ARGS[*]}"
+          set +e
+          timeout --signal=TERM 25m /usr/bin/time -f "ELAPSED_SEC=%e\nMAX_RSS_KB=%M" \
+            python "$SCRIPT_NAME" "${EXTRA_ARGS[@]}" >"$RUN_LOG" 2>"$LOG_DIR/time_and_stderr.log"
+          run_ec=$?
+          set -e
+
+          if [[ "$run_ec" -eq 124 ]]; then
+            echo "ERROR: experiment timed out" >&2
+          fi
+          if [[ "$run_ec" -ne 0 ]]; then
+            {
+              echo "==== FAILURE DIAGNOSTICS ===="
+              echo "Exit code: $run_ec"
+              echo "==== Python Version ===="
+              python --version
+              echo "==== Pip Freeze ===="
+              python -m pip freeze || true
+              echo "==== Last 200 lines of run log ===="
+              tail -n 200 "$RUN_LOG" || true
+              echo "==== Last 200 lines of stderr/time log ===="
+              tail -n 200 "$LOG_DIR/time_and_stderr.log" || true
+            } | tee "$DIAG_LOG"
+            exit "$run_ec"
+          fi
+
+          python - <<'PY' "$RUN_LOG" "$LOG_DIR/time_and_stderr.log" "$METRICS_JSON"
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+run_log = Path(sys.argv[1]).read_text(encoding="utf-8", errors="ignore")
+perf_log = Path(sys.argv[2]).read_text(encoding="utf-8", errors="ignore")
+out_json = Path(sys.argv[3])
+
+if re.search(r"(^|[^a-zA-Z])(nan|inf)([^a-zA-Z]|$)", run_log, flags=re.I):
+    print("ERROR: output contains NaN/inf")
+    raise SystemExit(31)
+
+bound_candidates = []
+for line in run_log.splitlines():
+    if re.search(r"pac|privacy|bound", line, flags=re.I):
+        for num in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", line):
+            try:
+                val = float(num)
+                if math.isfinite(val):
+                    bound_candidates.append(val)
+            except Exception:
+                pass
+
+if not bound_candidates:
+    print("ERROR: unable to parse PAC/privacy bound from output")
+    raise SystemExit(32)
+
+elapsed = re.search(r"ELAPSED_SEC=([0-9]*\.?[0-9]+)", perf_log)
+max_rss = re.search(r"MAX_RSS_KB=(\d+)", perf_log)
+if not elapsed or not max_rss:
+    print("ERROR: missing runtime/memory metrics")
+    raise SystemExit(33)
+
+metrics = {
+    "pac_bound": bound_candidates[0],
+    "all_bound_candidates": bound_candidates,
+    "elapsed_sec": float(elapsed.group(1)),
+    "max_rss_kb": int(max_rss.group(1)),
+}
+out_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+print(json.dumps(metrics, indent=2))
+PY
+
+      - name: Upload experiment artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pac-privacy-artifacts
+          path: |
+            work/upstream/../upstream_commit.txt
+            work/upstream/../python_version.txt
+            work/upstream/../artifacts/run.log
+            work/upstream/../artifacts/time_and_stderr.log
+            work/upstream/../artifacts/diagnostics.log
+            work/upstream/../artifacts/help.txt
+            work/upstream/../artifacts/pip_freeze.txt
+            work/upstream/../artifacts/metrics.json
+          if-no-files-found: warn
