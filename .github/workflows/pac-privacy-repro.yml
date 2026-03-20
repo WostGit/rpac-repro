@@ -1,0 +1,264 @@
+name: Reproducible PAC Privacy Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "Experiment script to run (smallest by default)"
+        required: false
+        default: "Iris_s.py"
+        type: choice
+        options:
+          - Iris_s.py
+          - MNIST_s.py
+  schedule:
+    - cron: "17 4 * * 1"
+
+jobs:
+  pac-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      PYTHON_VERSION: "3.10"
+      TARGET_REPO: "https://github.com/ztao10086/Residual-PAC-Privacy"
+      TARGET_DIR: "upstream"
+      VENV_DIR: ".venv"
+      MAX_INSTALL_ATTEMPTS: "10"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+      PIP_PROGRESS_BAR: "off"
+      PYTHONHASHSEED: "0"
+      CUBLAS_WORKSPACE_CONFIG: ":16:8"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      TORCH_NUM_THREADS: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      TARGET_SCRIPT: ${{ github.event.inputs.script || 'Iris_s.py' }}
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Clone upstream repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$TARGET_DIR"
+          git clone --depth 1 "$TARGET_REPO" "$TARGET_DIR"
+          git -C "$TARGET_DIR" rev-parse HEAD | tee upstream_commit.txt
+
+      - name: Reproducible install, validation, and run
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          LOG_DIR="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$LOG_DIR"
+          RUN_LOG="$LOG_DIR/run.log"
+          TIME_LOG="$LOG_DIR/time.log"
+          METRICS_JSON="$LOG_DIR/metrics.json"
+
+          diag_fail() {
+            local code="${1:-1}"
+            echo "\n========== FAILURE DIAGNOSTICS ==========" | tee -a "$RUN_LOG"
+            echo "Exit code: $code" | tee -a "$RUN_LOG"
+            python --version 2>&1 | tee -a "$RUN_LOG" || true
+            if [[ -f "$VENV_DIR/bin/python" ]]; then
+              "$VENV_DIR/bin/python" --version 2>&1 | tee -a "$RUN_LOG" || true
+            fi
+            if [[ -f "$VENV_DIR/bin/pip" ]]; then
+              "$VENV_DIR/bin/pip" freeze 2>&1 | tee "$LOG_DIR/pip-freeze.txt" || true
+              echo "Saved pip freeze to $LOG_DIR/pip-freeze.txt" | tee -a "$RUN_LOG"
+            fi
+            echo "------ Last 200 log lines ------" | tee -a "$RUN_LOG"
+            tail -n 200 "$RUN_LOG" || true
+            exit "$code"
+          }
+
+          recreate_venv() {
+            rm -rf "$VENV_DIR"
+            python -m venv "$VENV_DIR"
+            "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
+          }
+
+          validate_env() {
+            "$VENV_DIR/bin/python" - <<'PY'
+import importlib
+mods = ["numpy", "torch", "torchvision", "nflows", "sklearn"]
+for m in mods:
+    importlib.import_module(m)
+print("All required modules import successfully")
+PY
+          }
+
+          install_with_retry() {
+            local attempt=1
+            local max_attempts="${MAX_INSTALL_ATTEMPTS}"
+            local sleep_s=2
+            while (( attempt <= max_attempts )); do
+              echo "[install] attempt $attempt/$max_attempts" | tee -a "$RUN_LOG"
+              if "$VENV_DIR/bin/python" -m pip install \
+                numpy torch torchvision nflows scikit-learn \
+                >>"$RUN_LOG" 2>&1; then
+                if validate_env >>"$RUN_LOG" 2>&1; then
+                  echo "[install] validated" | tee -a "$RUN_LOG"
+                  return 0
+                fi
+                echo "[install] import validation failed; repairing environment" | tee -a "$RUN_LOG"
+              else
+                echo "[install] pip failed" | tee -a "$RUN_LOG"
+              fi
+
+              if (( attempt == max_attempts )); then
+                return 1
+              fi
+              echo "[install] backoff ${sleep_s}s, recreate venv" | tee -a "$RUN_LOG"
+              recreate_venv >>"$RUN_LOG" 2>&1 || true
+              sleep "$sleep_s"
+              sleep_s=$(( sleep_s * 2 ))
+              attempt=$(( attempt + 1 ))
+            done
+          }
+
+          trap 'diag_fail $?' ERR
+
+          echo "Python: $(python --version 2>&1)" | tee "$RUN_LOG"
+          recreate_venv >>"$RUN_LOG" 2>&1
+          install_with_retry
+
+          pushd "$TARGET_DIR" >/dev/null
+
+          # Ensure Iris data exists if Iris script is selected.
+          if [[ "$TARGET_SCRIPT" == "Iris_s.py" ]]; then
+            "$GITHUB_WORKSPACE/$VENV_DIR/bin/python" - <<'PY'
+from sklearn.datasets import load_iris
+X, y = load_iris(return_X_y=True)
+labels = ["Iris-setosa", "Iris-versicolor", "Iris-virginica"]
+with open("iris.data", "w", encoding="utf-8") as f:
+    for row, cls in zip(X, y):
+        f.write(",".join(f"{v:.1f}" for v in row) + "," + labels[int(cls)] + "\n")
+print("Wrote iris.data")
+PY
+          fi
+
+          # Build a minimal-resource patched copy to reduce CI load while preserving algorithm path.
+          "$GITHUB_WORKSPACE/$VENV_DIR/bin/python" - <<'PY'
+from pathlib import Path
+import os, re, sys
+script = Path(os.environ["TARGET_SCRIPT"])
+text = script.read_text(encoding="utf-8")
+patches = {
+    r"BETAS\s*=\s*\[[^\]]*\]": "BETAS = [1/128]",
+    r"POOL_SIZE\s*=\s*\d+": "POOL_SIZE = 4",
+    r"EFFICIENT_k\s*=\s*\d+": "EFFICIENT_k = 1",
+    r"SR_OUTER\s*=\s*\d+": "SR_OUTER = 2",
+    r"SR_INNER\s*=\s*\d+": "SR_INNER = 2",
+    r"CAL_BATCH\s*=\s*\d+": "CAL_BATCH = 8",
+    r"REPORT_BATCH\s*=\s*\d+": "REPORT_BATCH = 8",
+}
+if script.name == "Iris_s.py":
+    patches.update({
+        r"train_base_decoder\(Xt, Xv, d, epochs=80, batch_size=128, patience=10, steps_per_epoch=400, val_batches=100\)":
+        "train_base_decoder(Xt, Xv, d, epochs=3, batch_size=16, patience=1, steps_per_epoch=6, val_batches=2)",
+        r"find_opt_clipping_sum_to_mean\(([^\)]*?)trials=200": r"find_opt_clipping_sum_to_mean(\1trials=4",
+        r"train_noise_aware_decoder\(base_decoder, Xt, Sig_SR, steps=1200\)": "train_noise_aware_decoder(base_decoder, Xt, Sig_SR, steps=20)",
+        r"train_noise_aware_decoder\(base_decoder, Xt, Sig_Auto, steps=1200\)": "train_noise_aware_decoder(base_decoder, Xt, Sig_Auto, steps=20)",
+        r"train_noise_aware_decoder\(base_decoder, Xt, Sig_Eff, steps=1200\)": "train_noise_aware_decoder(base_decoder, Xt, Sig_Eff, steps=20)",
+        r"collect_lira_inputs_for_sigma\(([^\)]*?)n_points=120, n_in=80, n_out=80": r"collect_lira_inputs_for_sigma(\1n_points=12, n_in=8, n_out=8",
+    })
+elif script.name == "MNIST_s.py":
+    patches.update({
+        r"epochs\s*=\s*\d+": "epochs = 1",
+        r"batch_size\s*=\s*\d+": "batch_size = 8",
+    })
+
+patched = text
+for pattern, repl in patches.items():
+    patched = re.sub(pattern, repl, patched, flags=re.S)
+
+out = script.with_name(script.stem + "_ci_min.py")
+out.write_text(patched, encoding="utf-8")
+print(out)
+PY
+
+          PATCHED_SCRIPT="${TARGET_SCRIPT%.py}_ci_min.py"
+          if [[ ! -f "$PATCHED_SCRIPT" ]]; then
+            echo "Patched script not generated: $PATCHED_SCRIPT" | tee -a "$RUN_LOG"
+            exit 24
+          fi
+
+          echo "Running $PATCHED_SCRIPT" | tee -a "$RUN_LOG"
+          set +e
+          /usr/bin/time -v "$GITHUB_WORKSPACE/$VENV_DIR/bin/python" "$PATCHED_SCRIPT" >>"$RUN_LOG" 2>"$TIME_LOG"
+          run_exit=$?
+          set -e
+          if [[ $run_exit -ne 0 ]]; then
+            echo "Script exited non-zero: $run_exit" | tee -a "$RUN_LOG"
+            exit "$run_exit"
+          fi
+
+          "$GITHUB_WORKSPACE/$VENV_DIR/bin/python" - <<'PY'
+import json, math, os, re, sys
+from pathlib import Path
+
+run_log = Path(os.environ["RUN_LOG"]).read_text(encoding="utf-8", errors="replace")
+time_log = Path(os.environ["TIME_LOG"]).read_text(encoding="utf-8", errors="replace")
+
+if re.search(r"\b(?:nan|inf)\b", run_log.lower()):
+    print("Detected NaN/inf in output")
+    sys.exit(40)
+
+# Prefer SR-PAC achieved H_c from the summary loop as the PAC-style bound.
+m = re.findall(r"\[SR-PAC β=([0-9.eE+-]+)\]\s+target H_c=([0-9.eE+-]+),\s+achieved H_c=([0-9.eE+-]+)", run_log)
+if not m:
+    print("Could not parse PAC-style bound from output")
+    sys.exit(41)
+
+beta, target_hc, achieved_hc = m[-1]
+values = [float(beta), float(target_hc), float(achieved_hc)]
+if not all(math.isfinite(v) for v in values):
+    print("Non-finite PAC metrics parsed")
+    sys.exit(42)
+
+rt = re.search(r"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*(.+)", time_log)
+mem = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", time_log)
+if not rt or not mem:
+    print("Failed to parse runtime or peak memory from /usr/bin/time -v")
+    sys.exit(43)
+
+metrics = {
+    "beta": float(beta),
+    "target_h_c": float(target_hc),
+    "achieved_h_c": float(achieved_hc),
+    "runtime_wall_clock": rt.group(1).strip(),
+    "peak_memory_kb": int(mem.group(1)),
+}
+
+Path(os.environ["METRICS_JSON"]).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+print(json.dumps(metrics, indent=2))
+PY
+
+          popd >/dev/null
+        env:
+          RUN_LOG: ${{ github.workspace }}/artifacts/run.log
+          TIME_LOG: ${{ github.workspace }}/artifacts/time.log
+          METRICS_JSON: ${{ github.workspace }}/artifacts/metrics.json
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pac-privacy-artifacts
+          path: |
+            upstream_commit.txt
+            artifacts/run.log
+            artifacts/time.log
+            artifacts/metrics.json
+            artifacts/pip-freeze.txt
+          if-no-files-found: warn
